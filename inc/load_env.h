@@ -1,5 +1,5 @@
-#ifndef PRICE_FETCHER_H
-#define PRICE_FETCHER_H
+#ifndef ENV_H
+#define ENV_H
 
 #include <curl/curl.h>
 #include <fstream>

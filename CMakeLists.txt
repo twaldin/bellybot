@@ -4,7 +4,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "-Wall -Werror")
 
-include_directories(/opt/homebrew/include/)
-set(CMAKE_EXPORT_COMPILE_COMMANDS(ON))
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+include_directories(inc /opt/homebrew/include
+/opt/homebrew/opt/curl/include
+/opt/homebrew/Cellar/rapidjson/1.1.0/include/)
+link_directories(/opt/homebrew/opt/curl/lib)
+
+# Main executable
 add_executable(bellybot src/main.cpp)
-target_link_libraries(bellybot curl)
+target_link_libraries(bellybot curl pthread)
+
+
+
