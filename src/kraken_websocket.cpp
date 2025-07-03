@@ -5,46 +5,34 @@
 
 using namespace rapidjson;
 
-class KrakenWebSocketClient {
+class kraken_ws_client {
 private:
   CURL *curl;
   string url = "wss://ws.kraken.com";
   bool connected = false;
-  queue<string> message_queue;
-  mutex queue_mutex;
-  condition_variable queue_cv;
-  thread websocket_thread;
+  thread ws_thread;
   string response_data;
 
-  static size_t write_callback(void *contents, size_t size, size_t nmemb,
-                               void *userp) {
-    size_t realsize = size * nmemb;
-    KrakenWebSocketClient *client = static_cast<KrakenWebSocketClient *>(userp);
-    string data(static_cast<char *>(contents), realsize);
-    client->on_message(data);
-    return realsize;
-  }
-
 public:
-  KrakenWebSocketClient() {
+  kraken_ws_client() {
     curl = curl_easy_init();
     if (!curl) {
       throw runtime_error("Failed to initialize curl");
     }
   }
 
-  ~KrakenWebSocketClient() {
+  ~kraken_ws_client() {
     connected = false;
     if (curl) {
       curl_easy_cleanup(curl);
     }
-    if (websocket_thread.joinable()) {
-      websocket_thread.join();
+    if (ws_thread.joinable()) {
+      ws_thread.join();
     }
   }
 
   void connect() {
-    websocket_thread = thread([this]() {
+    ws_thread = thread([this]() {
       curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
       curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
 

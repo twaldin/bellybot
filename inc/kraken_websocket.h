@@ -2,16 +2,15 @@
 #define KRAKEN_WS_H
 
 #include <chrono>
-#include <condition_variable>
-#include <curl/curl.h>
 #include <iostream>
 #include <mutex>
-#include <queue>
+#include <string>
+#include <thread>
+
+#include <curl/curl.h>
 #include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
-#include <string>
-#include <thread>
 
 using namespace std;
 
