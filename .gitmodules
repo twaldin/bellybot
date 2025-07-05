@@ -1,0 +1,3 @@
+[submodule "external/jwt-cpp"]
+	path = external/jwt-cpp
+	url = https://github.com/Thalhammer/jwt-cpp.git

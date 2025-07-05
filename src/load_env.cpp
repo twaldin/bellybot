@@ -13,11 +13,6 @@ void loadEnvFile(const string &filename = ".env") {
       string key = line.substr(0, pos);
       string value = line.substr(pos + 1);
 
-      // Remove quotes if present
-      if (value.front() == '"' && value.back() == '"') {
-        value = value.substr(1, value.length() - 2);
-      }
-
       setenv(key.c_str(), value.c_str(), 1);
     }
   }

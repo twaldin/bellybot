@@ -2,8 +2,16 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include "coinbase_websocket.h"
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <map>
+#include <sstream>
 
 using namespace rapidjson;
+
+string get_timestamp() { return to_string(time(nullptr)); }
 
 struct OrderbookEntry {
   double price;
@@ -28,12 +36,16 @@ private:
   thread ws_thread;
   string response_data;
   string message_buffer;
-  string api_key;
-  string api_secret;
+  bool snapshot_loaded = false;
+  int fragment_count = 0;
 
-  vector<OrderbookEntry> bids;
-  vector<OrderbookEntry> asks;
+  map<double, double, greater<double>> bids;
+  map<double, double> asks;
   TickerData latest_ticker;
+
+  string current_price = "Loading...";
+  string current_bid = "Loading...";
+  string current_ask = "Loading...";
 
 public:
   coinbase_ws_client() {
@@ -41,6 +53,8 @@ public:
     if (!curl) {
       throw runtime_error("Failed to initialize curl");
     }
+
+    // No API credentials needed for public market data
   }
 
   ~coinbase_ws_client() {
@@ -63,7 +77,9 @@ public:
         connected = true;
         cout << "Coinbase WebSocket connection opened" << endl;
 
-        subscribe_to_channels("BTC-USD");
+        // Subscribe to each channel individually to avoid auth issues
+        subscribe_to_channels({"BTC-USD"}, {"level2"});
+        subscribe_to_channels({"BTC-USD"}, {"ticker"});
 
         while (connected) {
           receive_messages();
@@ -78,47 +94,51 @@ public:
     this_thread::sleep_for(chrono::seconds(2));
   }
 
-  void subscribe_to_channels(const string &product_id) {
+  void subscribe_to_channels(const vector<string> &product_ids,
+                             const vector<string> &channels) {
     if (!connected) {
       cout << "Not connected to WebSocket" << endl;
       return;
     }
 
-    // Subscribe to level2 channel
-    subscribe_to_channel(product_id, "level2");
-
-    // Subscribe to ticker channel
-    subscribe_to_channel(product_id, "ticker");
-  }
-
-  void subscribe_to_channel(const string &product_id, const string &channel) {
     Document subscription;
     subscription.SetObject();
     Document::AllocatorType &allocator = subscription.GetAllocator();
 
     subscription.AddMember("type", Value("subscribe", allocator), allocator);
 
-    Value product_ids(kArrayType);
-    product_ids.PushBack(Value(product_id.c_str(), allocator), allocator);
-    subscription.AddMember("product_ids", product_ids, allocator);
+    Value product_ids_array(kArrayType);
+    for (const string &product_id : product_ids) {
+      product_ids_array.PushBack(Value(product_id.c_str(), allocator),
+                                 allocator);
+    }
+    subscription.AddMember("product_ids", product_ids_array, allocator);
 
-    subscription.AddMember("channel", Value(channel.c_str(), allocator),
-                           allocator);
+    // For single channel, use "channel" instead of "channels" array
+    if (channels.size() == 1) {
+      subscription.AddMember("channel", Value(channels[0].c_str(), allocator),
+                             allocator);
+    } else {
+      Value channels_array(kArrayType);
+      for (const string &channel : channels) {
+        channels_array.PushBack(Value(channel.c_str(), allocator), allocator);
+      }
+      subscription.AddMember("channels", channels_array, allocator);
+    }
 
     StringBuffer buffer;
     Writer<StringBuffer> writer(buffer);
     subscription.Accept(writer);
 
     string message = buffer.GetString();
-    cout << "Sending " << channel << " subscription: " << message << endl;
+    cout << "Sending subscription: " << message << endl;
 
     size_t sent;
     CURLcode res = curl_ws_send(curl, message.c_str(), message.length(), &sent,
                                 0, CURLWS_TEXT);
 
     if (res != CURLE_OK) {
-      cout << "Send error for " << channel << ": " << curl_easy_strerror(res)
-           << endl;
+      cout << "Send error: " << curl_easy_strerror(res) << endl;
     }
   }
 
@@ -132,63 +152,46 @@ public:
     if (res == CURLE_OK && received > 0) {
       string fragment(buffer, received);
 
-      // Add fragment to buffer
+      // Add fragment to buffer and show loading progress
       message_buffer += fragment;
+      fragment_count++;
 
-      // Look for complete JSON messages
-      size_t pos = 0;
-      while (pos < message_buffer.length()) {
-        // Find the start of a JSON object
-        size_t start = message_buffer.find('{', pos);
-        if (start == string::npos)
-          break;
+      if (!snapshot_loaded) {
+        show_loading_dashboard(fragment.length(), message_buffer.length());
+      }
+      // Handle very large snapshots by setting a reasonable limit
+      if (message_buffer.length() >
+          1000000000) { // 1GB limit for maximum size snapshots
+        cout << "Buffer too large (" << message_buffer.length()
+             << " bytes), trying to parse anyway..." << endl;
 
-        // Parse from the opening brace
-        int brace_count = 0;
-        bool in_string = false;
-        char prev_char = 0;
-        size_t end = start;
-
-        for (size_t i = start; i < message_buffer.length(); i++) {
-          char c = message_buffer[i];
-
-          if (c == '"' && prev_char != '\\') {
-            in_string = !in_string;
-          } else if (!in_string) {
-            if (c == '{') {
-              brace_count++;
-            } else if (c == '}') {
-              brace_count--;
-              if (brace_count == 0) {
-                // Found complete JSON object
-                end = i;
-                string complete_message =
-                    message_buffer.substr(start, end - start + 1);
-                cout << "Complete message found: " << complete_message.length()
-                     << " bytes" << endl;
-                on_message(complete_message);
-                pos = end + 1;
-                break;
-              }
-            }
-          }
-          prev_char = c;
+        // Try to parse the entire buffer as JSON
+        Document large_doc;
+        large_doc.Parse(message_buffer.c_str());
+        if (!large_doc.HasParseError()) {
+          cout << "Successfully parsed large JSON message!" << endl;
+          on_message(message_buffer);
+          message_buffer.clear();
+          return;
+        } else {
+          cout << "Failed to parse large buffer, clearing..." << endl;
+          message_buffer.clear();
+          return;
         }
-
-        // If we didn't find a complete message, break, and wait for more data
-        if (brace_count != 0)
-          break;
       }
 
-      // Remove processed messages from buffer
-      if (pos > 0) {
-        message_buffer = message_buffer.substr(pos);
+      // Try to parse current buffer as complete JSON
+      Document buffer_doc;
+      buffer_doc.Parse(message_buffer.c_str());
+      if (!buffer_doc.HasParseError()) {
+        cout << "Complete JSON message found! Length: "
+             << message_buffer.length() << " bytes" << endl;
+        on_message(message_buffer);
+        message_buffer.clear();
       }
-
-      cout << "Buffer size: " << message_buffer.length() << " bytes" << endl;
 
       // Prevent buffer from growing too large
-      if (message_buffer.length() > 100000) {
+      if (message_buffer.length() > 1000000000) {
         message_buffer.clear();
       }
 
@@ -201,41 +204,257 @@ public:
     Document root;
     root.Parse(message.c_str());
 
-    if (!root.HasParseError()) {
-      if (root.HasMember("type")) {
-        string type = root["type"].GetString();
-        cout << "Message type: " << type << endl;
-
-        if (type == "subscriptions") {
-          display_subscription_confirmation(root);
-        } else if (type == "ticker") {
-          display_ticker_update(root);
-        } else if (type == "l2update") {
-          display_orderbook_update(root);
-        } else if (type == "snapshot") {
-          display_orderbook_snapshot(root);
-        } else {
-          cout << "Unknown message type: " << type << endl;
-        }
-      } else if (root.HasMember("channel")) {
-        string channel = root["channel"].GetString();
-        cout << "Message channel: " << channel << endl;
-
-        if (channel == "l2_data") {
-          display_orderbook_update(root);
-        } else if (channel == "ticker") {
-          display_ticker_update(root);
-        }
-      } else if (root.HasMember("side") && root.HasMember("price_level") &&
-                 root.HasMember("new_quantity")) {
-        // This is a level2 orderbook update
-        display_level2_update(root);
-      } else {
-        cout << "Unknown message format" << endl;
-      }
-    } else {
-      cout << "JSON parse error in message" << endl;
+    if (root.HasParseError()) {
+      cout << "❌ JSON parse error!" << endl;
+      return;
     }
+
+    if (root.HasMember("channel")) {
+      string channel = root["channel"].GetString();
+
+      if (channel == "l2_data") {
+        handle_l2_data(root);
+      } else if (channel == "ticker") {
+        if (root.HasMember("events")) {
+          const Value &events = root["events"];
+          for (auto &event : events.GetArray()) {
+            handle_ticker_data(event);
+          }
+        }
+      } else if (channel == "subscriptions") {
+        display_subscription_confirmation(root);
+      }
+    } else if (root.HasMember("type")) {
+      string type = root["type"].GetString();
+
+      if (type == "subscriptions") {
+        display_subscription_confirmation(root);
+      } else if (type == "error") {
+        if (root.HasMember("message")) {
+          cout << "❌ ERROR: " << root["message"].GetString() << endl;
+        }
+      }
+    }
+  }
+  void handle_l2_data(const Document &root) {
+    if (!root.HasMember("events"))
+      return;
+
+    const Value &events = root["events"];
+    for (auto &event : events.GetArray()) {
+      handle_l2_event(event);
+    }
+  }
+
+  void handle_l2_event(const Value &event) {
+    if (!event.HasMember("type") || !event.HasMember("product_id"))
+      return;
+
+    string type = event["type"].GetString();
+    string product_id = event["product_id"].GetString();
+
+    if (type == "snapshot") {
+      handle_l2_snapshot(event, product_id);
+    } else if (type == "update") {
+      handle_l2_update(event, product_id);
+    }
+  }
+
+  void clear_screen() { cout << "\033[2J\033[H" << flush; }
+
+  void show_loading_dashboard(size_t fragment_size, size_t buffer_size) {
+    clear_screen();
+    cout << "🚀 BellyBot - Coinbase Advanced Trade API Monitor\n" << endl;
+    cout << "📡 Connecting to Coinbase Advanced Trade WebSocket..." << endl;
+    cout << "🔄 Loading orderbook snapshot...\n" << endl;
+
+    cout << "📊 SNAPSHOT LOADING PROGRESS:" << endl;
+    cout << "┌─────────────────────────────────────────────────┐" << endl;
+
+    cout << "│ Fragment #" << setw(4) << fragment_count << " received"
+         << setw(28) << "│" << endl;
+    cout << "│ Fragment Size: " << setw(8) << fragment_size << " bytes"
+         << setw(22) << "│" << endl;
+    cout << "│ Buffer Size:   " << setw(8) << buffer_size << " bytes"
+         << setw(22) << "│" << endl;
+    cout << "│ Progress:      " << setw(6) << fixed << setprecision(1)
+         << (buffer_size / 1024.0) << " KB" << setw(27) << "│" << endl;
+    cout << "└─────────────────────────────────────────────────┘" << endl;
+
+    // Progress bar
+    int progress_width = 40;
+    int estimated_size = 5000000; // 5MB estimated
+    int progress = min(progress_width,
+                       (int)((buffer_size * progress_width) / estimated_size));
+
+    cout << "\n[";
+    for (int i = 0; i < progress_width; i++) {
+      if (i < progress) {
+        cout << "█";
+      } else {
+        cout << "░";
+      }
+    }
+    cout << "] " << (progress * 100 / progress_width) << "%" << endl;
+
+    cout << "\n⏳ Please wait while the complete orderbook loads..." << endl;
+  }
+
+  void handle_l2_snapshot(const Value &event, const string &product_id) {
+    snapshot_loaded = true; // Mark snapshot as loaded
+    clear_screen();
+    cout << "🚀 BellyBot - Coinbase Advanced Trade API Monitor\n" << endl;
+    cout << "✅ ORDERBOOK SNAPSHOT LOADED: " << product_id << endl;
+    cout << "📊 Total fragments received: " << fragment_count << endl;
+    cout << "💾 Final buffer size: " << fixed << setprecision(2)
+         << (message_buffer.length() / 1024.0 / 1024.0) << " MB\n"
+         << endl;
+
+    if (!event.HasMember("updates"))
+      return;
+
+    const Value &updates = event["updates"];
+    for (auto &update : updates.GetArray()) {
+      if (!update.HasMember("side") || !update.HasMember("price_level") ||
+          !update.HasMember("new_quantity")) {
+        continue;
+      }
+
+      string side = update["side"].GetString();
+      double price = stod(update["price_level"].GetString());
+      double quantity = stod(update["new_quantity"].GetString());
+
+      if (side == "bid") {
+        bids[price] = quantity;
+      } else if (side == "offer") {
+        asks[price] = quantity;
+      }
+    }
+
+    cout << "📈 Bids: " << bids.size() << " levels | 📉 Asks: " << asks.size()
+         << " levels" << endl;
+    cout << "🔄 Real-time updates active...\n" << endl;
+  }
+
+  void handle_l2_update(const Value &event, const string &product_id) {
+    if (!event.HasMember("updates"))
+      return;
+
+    const Value &updates = event["updates"];
+
+    for (auto &update : updates.GetArray()) {
+      add_update_to_dashboard(update);
+    }
+
+    // Refresh dashboard after processing all updates
+    show_live_dashboard();
+  }
+
+  void add_update_to_dashboard(const Value &update) {
+    if (!update.HasMember("side") || !update.HasMember("price_level") ||
+        !update.HasMember("new_quantity")) {
+      return;
+    }
+
+    string side = update["side"].GetString();
+    double price = stod(update["price_level"].GetString());
+    double quantity = stod(update["new_quantity"].GetString());
+
+    if (side == "bid") {
+      if (quantity == 0) {
+        bids.erase(price);
+      } else {
+        bids[price] = quantity;
+      }
+    } else if (side == "offer") {
+      if (quantity == 0) {
+        asks.erase(price);
+      } else {
+        asks[price] = quantity;
+      }
+    }
+  }
+
+  void show_live_dashboard() {
+    clear_screen();
+    cout << "🚀 BellyBot - Coinbase Advanced Trade API Monitor\n" << endl;
+    cout << "💰 BTC-USD: " << current_price << " | Bid: " << current_bid
+         << " | Ask: " << current_ask << "\n"
+         << endl;
+
+    cout << "┌─────────────── BIDS 🟢 ───────────────┬─────────────── ASKS 🔴 "
+            "───────────────┐"
+         << endl;
+
+    auto bid_it = bids.begin();
+    auto ask_it = asks.begin();
+
+    for (int i = 0; i < 10; ++i) {
+      string bid_line;
+      if (bid_it != bids.end()) {
+        ostringstream bid_str;
+        bid_str << "$" << fixed << setprecision(2) << bid_it->first << " → "
+                << setprecision(12) << bid_it->second << " BTC";
+        bid_line = bid_str.str();
+        ++bid_it;
+      } else {
+        bid_line = "";
+      }
+
+      string ask_line;
+      if (ask_it != asks.end()) {
+        ostringstream ask_str;
+        ask_str << "$" << fixed << setprecision(2) << ask_it->first << " → "
+                << setprecision(12) << ask_it->second << " BTC";
+        ask_line = ask_str.str();
+        ++ask_it;
+      } else {
+        ask_line = "";
+      }
+
+      cout << "│ " << setw(39) << left << bid_line << " │ " << setw(39) << left
+           << ask_line << " │" << endl;
+    }
+
+    cout << "└───────────────────────────────────────┴─────────────────────────"
+            "──────────────┘"
+         << endl;
+    cout << "\n🔄 Live updates | Press Ctrl+C to exit" << endl;
+  }
+
+  void handle_ticker_data(const Value &event) {
+    if (!event.HasMember("tickers"))
+      return;
+
+    const Value &tickers = event["tickers"];
+    for (auto &ticker : tickers.GetArray()) {
+      display_ticker_entry(ticker);
+    }
+  }
+
+  void display_ticker_entry(const Value &ticker) {
+    if (!ticker.HasMember("product_id") || !ticker.HasMember("price"))
+      return;
+
+    double price = stod(ticker["price"].GetString());
+
+    ostringstream price_str;
+    price_str << "$" << fixed << setprecision(2) << price;
+    current_price = price_str.str();
+
+    if (ticker.HasMember("best_bid") && ticker.HasMember("best_ask")) {
+      double bid = stod(ticker["best_bid"].GetString());
+      double ask = stod(ticker["best_ask"].GetString());
+
+      ostringstream bid_str, ask_str;
+      bid_str << "$" << fixed << setprecision(2) << bid;
+      ask_str << "$" << fixed << setprecision(2) << ask;
+      current_bid = bid_str.str();
+      current_ask = ask_str.str();
+    }
+
+    // Update dashboard with new ticker info
+    show_live_dashboard();
   }
 
   void display_subscription_confirmation(const Document &root) {
@@ -247,69 +466,6 @@ public:
       }
     }
     cout << endl;
-  }
-
-  void display_ticker_update(const Document &root) {
-    if (root.HasMember("product_id") && root.HasMember("price")) {
-      string product_id = root["product_id"].GetString();
-      double price = stod(root["price"].GetString());
-
-      cout << "📈 TICKER: " << product_id << " → $" << fixed << setprecision(2)
-           << price;
-
-      if (root.HasMember("best_bid") && root.HasMember("best_ask")) {
-        double bid = stod(root["best_bid"].GetString());
-        double ask = stod(root["best_ask"].GetString());
-        cout << " (Bid: $" << bid << " Ask: $" << ask << ")";
-      }
-      cout << endl;
-    }
-  }
-
-  void display_orderbook_snapshot(const Document &root) {
-    if (root.HasMember("product_id")) {
-      string product_id = root["product_id"].GetString();
-      cout << "📊 ORDERBOOK SNAPSHOT: " << product_id << endl;
-
-      if (root.HasMember("bids") && root.HasMember("asks")) {
-        const Value &bids = root["bids"];
-        const Value &asks = root["asks"];
-        cout << "   Bids: " << bids.Size() << " levels, Asks: " << asks.Size()
-             << " levels" << endl;
-      }
-    }
-  }
-
-  void display_orderbook_update(const Document &root) {
-    if (root.HasMember("product_id") && root.HasMember("changes")) {
-      string product_id = root["product_id"].GetString();
-      const Value &changes = root["changes"];
-
-      cout << "📋 ORDERBOOK UPDATE: " << product_id << " (" << changes.Size()
-           << " changes)" << endl;
-
-      for (auto &change : changes.GetArray()) {
-        string side = change[0].GetString();
-        double price = stod(change[1].GetString());
-        double size = stod(change[2].GetString());
-
-        cout << "   " << (side == "buy" ? "🟢 BUY" : "🔴 SELL") << " $" << fixed
-             << setprecision(2) << price << " (" << size << ")" << endl;
-      }
-    }
-  }
-
-  void display_level2_update(const Document &root) {
-    if (root.HasMember("side") && root.HasMember("price_level") &&
-        root.HasMember("new_quantity")) {
-      string side = root["side"].GetString();
-      double price = stod(root["price_level"].GetString());
-      double quantity = stod(root["new_quantity"].GetString());
-
-      cout << "📊 " << (side == "bid" ? "🟢 BID" : "🔴 ASK") << " $" << fixed
-           << setprecision(2) << price << " → " << setprecision(8) << quantity
-           << " BTC" << endl;
-    }
   }
 
   void run() {
